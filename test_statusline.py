@@ -32,6 +32,55 @@ def make_transcript(iso_ts: str, model: str = "gemini-4-neon-xhigh") -> str:
     return tf.name
 
 
+def make_compaction_transcript(checkpoint_ts: str, summary_tokens: int = 4287, next_turn_ts: str | None = None) -> str:
+    tf = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8")
+    tf.write(
+        json.dumps(
+            {
+                "step_index": 801,
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-23T12:00:00Z",
+                "model": "gemini-4-carbon-high",
+                "input_tokens": 2121,
+                "cache_read_tokens": 462655,
+                "output_tokens": 3619,
+            }
+        )
+        + "\n"
+    )
+    tf.write(
+        json.dumps(
+            {
+                "step_index": 804,
+                "type": "CHECKPOINT",
+                "created_at": checkpoint_ts,
+                "input_tokens": 469427,
+                "cache_read_tokens": 0,
+                "output_tokens": summary_tokens,
+                "content": "# Resuming from a compaction",
+            }
+        )
+        + "\n"
+    )
+    if next_turn_ts:
+        tf.write(
+            json.dumps(
+                {
+                    "step_index": 806,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": next_turn_ts,
+                    "model": "gemini-4-carbon-high",
+                    "input_tokens": 17983,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 689,
+                }
+            )
+            + "\n"
+        )
+    tf.close()
+    return tf.name
+
+
 class TestStatusline(unittest.TestCase):
     def setUp(self) -> None:
         self.t_recent = make_transcript("2026-11-23T14:39:00Z")  # 22:39 +08:00
@@ -166,6 +215,54 @@ class TestStatusline(unittest.TestCase):
             for ln in sl.render(p, now_local=NOW).splitlines():
                 self.assertLessEqual(sl.visible_width(ln), cols - 2)
 
+
+    def test_compact_checkpoint_resets_cache_and_updates_context(self) -> None:
+        t_compact = make_compaction_transcript("2026-11-23T14:40:00Z", summary_tokens=4287)
+        try:
+            payload = {
+                "model": {"id": "gemini-4-carbon-high"},
+                "transcript_path": t_compact,
+                "terminal_width": 100,
+                "quota": self.quota,
+                "context_window": {
+                    "context_window_size": 1048576,
+                    "total_input_tokens": 451000,
+                    "used_percentage": 43.0,
+                },
+            }
+            lines = self._plain_lines(payload)
+            self.assertEqual(len(lines), 2)
+            self.assertIn("2.2% (23k/1M)", lines[0])
+            self.assertNotIn("43.0%", lines[0])
+            self.assertNotIn("451k", lines[0])
+            self.assertIn("缓存 0% (已重置)", lines[0])
+            self.assertNotIn("463k", lines[0])
+            self.assertNotIn("约已过期", lines[0])
+        finally:
+            if os.path.exists(t_compact):
+                os.remove(t_compact)
+
+    def test_post_compaction_subsequent_turn_resumes_normal_metrics(self) -> None:
+        t_next = make_compaction_transcript("2026-11-23T14:40:00Z", summary_tokens=4287, next_turn_ts="2026-11-23T14:41:00Z")
+        try:
+            payload = {
+                "model": {"id": "gemini-4-carbon-high"},
+                "transcript_path": t_next,
+                "terminal_width": 100,
+                "quota": self.quota,
+                "context_window": {
+                    "context_window_size": 1048576,
+                    "total_input_tokens": 18000,
+                    "used_percentage": 1.7,
+                },
+            }
+            lines = self._plain_lines(payload)
+            self.assertEqual(len(lines), 2)
+            self.assertIn("1.7% (18k/1M)", lines[0])
+            self.assertIn("缓存 0% (未命中)", lines[0])
+        finally:
+            if os.path.exists(t_next):
+                os.remove(t_next)
 
 if __name__ == "__main__":
     unittest.main()

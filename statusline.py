@@ -127,7 +127,7 @@ def resolve_transcript_path(transcript_path: str, conversation_id: str) -> str |
 
 
 def read_last_planner_response(transcript_path: str, conversation_id: str = "") -> dict[str, Any] | None:
-    """Efficiently read the latest PLANNER_RESPONSE entry from the tail of transcript.jsonl."""
+    """Efficiently read the latest PLANNER_RESPONSE or CHECKPOINT entry from the tail of transcript.jsonl."""
     path = resolve_transcript_path(transcript_path, conversation_id)
     if not path:
         return None
@@ -148,13 +148,14 @@ def read_last_planner_response(transcript_path: str, conversation_id: str = "") 
                 lines = lines[1:]
 
             for line in reversed(lines):
-                if '"PLANNER_RESPONSE"' not in line:
+                if '"PLANNER_RESPONSE"' not in line and '"CHECKPOINT"' not in line:
                     continue
                 try:
                     rec = json.loads(line)
                 except Exception:
                     continue
-                if rec.get("type") == "PLANNER_RESPONSE":
+                rec_type = rec.get("type")
+                if rec_type in ("PLANNER_RESPONSE", "CHECKPOINT"):
                     return rec
 
             if read_len >= size:
@@ -218,6 +219,15 @@ def compute_context_metrics(
     raw_pct = cw.get("used_percentage")
     cur = cw.get("current_usage") if isinstance(cw.get("current_usage"), dict) else None
 
+    # Handle post-compaction state where latest turn event is CHECKPOINT
+    if last_rec and last_rec.get("type") == "CHECKPOINT":
+        summary_tokens = int(last_rec.get("output_tokens") or 0)
+        base_overhead = 18_700  # System instructions, skills, tools baseline overhead
+        used_tokens = base_overhead + summary_tokens
+        used_pct = (used_tokens / window_size * 100.0) if window_size > 0 else 0.0
+        used_pct = max(0.0, min(100.0, used_pct))
+        return used_pct, used_tokens, window_size
+
     cur_tokens = 0
     if cur:
         cur_tokens = (
@@ -257,6 +267,10 @@ def compute_cache_metrics(
     last_rec: dict[str, Any] | None,
 ) -> tuple[bool, float, int]:
     """Return (has_data, hit_pct, cache_read_tokens)."""
+    # In post-compaction state (CHECKPOINT), previous prompt cache prefix is invalidated
+    if last_rec and last_rec.get("type") == "CHECKPOINT":
+        return True, 0.0, 0
+
     cur = cw.get("current_usage") if isinstance(cw.get("current_usage"), dict) else None
 
     inp = cr = cc = 0
@@ -340,6 +354,7 @@ def render_session_line(
     model_name: str,
     now_local: datetime,
     max_width: int,
+    is_compacted: bool = False,
 ) -> str:
     """Line 1: Context window progress bar + Prompt cache hit & expiry."""
     tiers = [
@@ -375,9 +390,12 @@ def render_session_line(
             cache_seg = f"{FG_GRAY}缓存 待首轮{RESET}"
         elif cache_read <= 0:
             k_col = cache_color(0.0, is_miss=True)
-            miss_tag = "(冷)" if opt["tight"] else "(未命中)"
+            if is_compacted:
+                miss_tag = "(冷)" if opt["tight"] else "(已重置)"
+            else:
+                miss_tag = "(冷)" if opt["tight"] else "(未命中)"
             cache_seg = f"{FG_GRAY}缓存{RESET} {k_col}{BOLD}0%{RESET}{sp}{FG_GRAY}{miss_tag}{RESET}"
-            if exp_text:
+            if exp_text and not is_compacted:
                 cache_seg += f" {exp_col}{exp_text}{RESET}"
         else:
             k_col = cache_color(hit_pct, is_miss=False)
@@ -483,6 +501,7 @@ def render(payload: dict[str, Any], now_local: datetime | None = None) -> str:
     )
     last_ts_iso = (last_rec or {}).get("created_at")
 
+    is_compacted = bool(last_rec and last_rec.get("type") == "CHECKPOINT")
     used_pct, used_tokens, window_size = compute_context_metrics(cw, last_rec)
     has_cache, hit_pct, cache_read = compute_cache_metrics(cw, last_rec)
 
@@ -497,6 +516,7 @@ def render(payload: dict[str, Any], now_local: datetime | None = None) -> str:
         model_name,
         now,
         max_width,
+        is_compacted=is_compacted,
     )
     line2 = render_quota_line(quota, model_name, now, max_width)
     return f"{line1}\n{line2}" if line2 else line1
