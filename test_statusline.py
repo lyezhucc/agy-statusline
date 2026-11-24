@@ -32,6 +32,55 @@ def make_transcript(iso_ts: str, model: str = "gemini-4-neon-xhigh") -> str:
     return tf.name
 
 
+def make_compaction_transcript(checkpoint_ts: str, summary_tokens: int = 4287, next_turn_ts: str | None = None) -> str:
+    tf = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8")
+    tf.write(
+        json.dumps(
+            {
+                "step_index": 801,
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-23T12:00:00Z",
+                "model": "gemini-4-carbon-high",
+                "input_tokens": 2121,
+                "cache_read_tokens": 462655,
+                "output_tokens": 3619,
+            }
+        )
+        + "\n"
+    )
+    tf.write(
+        json.dumps(
+            {
+                "step_index": 804,
+                "type": "CHECKPOINT",
+                "created_at": checkpoint_ts,
+                "input_tokens": 469427,
+                "cache_read_tokens": 0,
+                "output_tokens": summary_tokens,
+                "content": "# Resuming from a compaction",
+            }
+        )
+        + "\n"
+    )
+    if next_turn_ts:
+        tf.write(
+            json.dumps(
+                {
+                    "step_index": 806,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": next_turn_ts,
+                    "model": "gemini-4-carbon-high",
+                    "input_tokens": 17983,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 689,
+                }
+            )
+            + "\n"
+        )
+    tf.close()
+    return tf.name
+
+
 class TestStatusline(unittest.TestCase):
     def setUp(self) -> None:
         self.t_recent = make_transcript("2026-11-23T14:39:00Z")  # 22:39 +08:00
@@ -74,7 +123,7 @@ class TestStatusline(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertIn("17.6% (185k/1M)", lines[0])
         self.assertIn("缓存 95% (168k) 约23:39过期", lines[0])
-        self.assertEqual(lines[1], "限额(Gemini) 5h剩88% (00:24重置) │ 周剩85% (11-29 15:36重置)")
+        self.assertEqual(lines[1], "限额(Gemini) 5h剩88% (1时44分后重置) │ 周剩85% (5天16时后重置)")
 
     def test_claude_exact_ttl_and_3p_pool(self) -> None:
         lines = self._plain_lines(
@@ -99,7 +148,7 @@ class TestStatusline(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertIn("22:44过期", lines[0])
         self.assertNotIn("约22:44", lines[0])
-        self.assertEqual(lines[1], "限额(3P) 5h剩40% (02:10重置) │ 周剩12% (11-30 22:00重置)")
+        self.assertEqual(lines[1], "限额(3P) 5h剩40% (3时29分后重置) │ 周剩12% (6天23时后重置)")
 
     def test_hydrogen_and_expired_labels(self) -> None:
         lines_h = self._plain_lines(
@@ -166,6 +215,77 @@ class TestStatusline(unittest.TestCase):
             for ln in sl.render(p, now_local=NOW).splitlines():
                 self.assertLessEqual(sl.visible_width(ln), cols - 2)
 
+
+    def test_compact_checkpoint_resets_cache_and_updates_context(self) -> None:
+        t_compact = make_compaction_transcript("2026-11-23T14:40:00Z", summary_tokens=4287)
+        try:
+            payload = {
+                "model": {"id": "gemini-4-carbon-high"},
+                "transcript_path": t_compact,
+                "terminal_width": 100,
+                "quota": self.quota,
+                "context_window": {
+                    "context_window_size": 1048576,
+                    "total_input_tokens": 451000,
+                    "used_percentage": 43.0,
+                },
+            }
+            lines = self._plain_lines(payload)
+            self.assertEqual(len(lines), 2)
+            self.assertIn("2.2% (23k/1M)", lines[0])
+            self.assertNotIn("43.0%", lines[0])
+            self.assertNotIn("451k", lines[0])
+            self.assertIn("缓存 0% (已重置)", lines[0])
+            self.assertNotIn("463k", lines[0])
+            self.assertNotIn("约已过期", lines[0])
+        finally:
+            if os.path.exists(t_compact):
+                os.remove(t_compact)
+
+    def test_post_compaction_subsequent_turn_resumes_normal_metrics(self) -> None:
+        t_next = make_compaction_transcript("2026-11-23T14:40:00Z", summary_tokens=4287, next_turn_ts="2026-11-23T14:41:00Z")
+        try:
+            payload = {
+                "model": {"id": "gemini-4-carbon-high"},
+                "transcript_path": t_next,
+                "terminal_width": 100,
+                "quota": self.quota,
+                "context_window": {
+                    "context_window_size": 1048576,
+                    "total_input_tokens": 18000,
+                    "used_percentage": 1.7,
+                },
+            }
+            lines = self._plain_lines(payload)
+            self.assertEqual(len(lines), 2)
+            self.assertIn("1.7% (18k/1M)", lines[0])
+            self.assertIn("缓存 0% (未命中)", lines[0])
+        finally:
+            if os.path.exists(t_next):
+                os.remove(t_next)
+
+    def test_reset_countdown_boundaries(self) -> None:
+        # Past or missing -> empty
+        self.assertEqual(sl.format_reset_time(None, NOW, False, False), "")
+        self.assertEqual(sl.format_reset_time(NOW, NOW, False, False), "")
+        self.assertEqual(sl.format_reset_time(NOW - timedelta(seconds=1), NOW, False, False), "")
+        # Sub-minute rounds up to 1分
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(seconds=10), NOW, False, False), "1分后重置")
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(seconds=10), NOW, False, True), "1分")
+        # Minutes only
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(minutes=42), NOW, False, False), "42分后重置")
+        # Exact hours & hours+minutes with zero-padded minutes
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(hours=2), NOW, False, False), "2时后重置")
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(hours=1, minutes=5), NOW, False, False), "1时05分后重置")
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(hours=1, minutes=5), NOW, False, True), "1时05分")
+        # 23h59m30s rounds up cleanly to 1天 instead of 24时
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(hours=23, minutes=59, seconds=30), NOW, True, False), "1天后重置")
+        # Multi-day + hours & exact days
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(days=4, hours=16, minutes=14), NOW, True, False), "4天16时后重置")
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(days=4, hours=16, minutes=14), NOW, True, True), "4天16时")
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(days=6), NOW, True, False), "6天后重置")
+        # Weekly window < 24h falls back to hours/minutes countdown
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(hours=18, minutes=7), NOW, True, False), "18时07分后重置")
 
 if __name__ == "__main__":
     unittest.main()

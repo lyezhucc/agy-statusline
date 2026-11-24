@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Antigravity CLI (agy) custom status line (2-line layout):
   Line 1: Context progress bar + Prompt cache hit rate & estimated expiry
-  Line 2: 5h & Weekly remaining quota + reset timestamps (auto-matches Gemini vs 3P pool)
+  Line 2: 5h & Weekly remaining quota + reset countdown (auto-matches Gemini vs 3P pool)
 
 Designed for stack_with_default: true in ~/.gemini/antigravity-cli/settings.json.
 Pure Python standard library, zero external dependencies, CJK-aware width adaptation.
@@ -10,6 +10,7 @@ Pure Python standard library, zero external dependencies, CJK-aware width adapta
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -127,7 +128,7 @@ def resolve_transcript_path(transcript_path: str, conversation_id: str) -> str |
 
 
 def read_last_planner_response(transcript_path: str, conversation_id: str = "") -> dict[str, Any] | None:
-    """Efficiently read the latest PLANNER_RESPONSE entry from the tail of transcript.jsonl."""
+    """Efficiently read the latest PLANNER_RESPONSE or CHECKPOINT entry from the tail of transcript.jsonl."""
     path = resolve_transcript_path(transcript_path, conversation_id)
     if not path:
         return None
@@ -148,13 +149,14 @@ def read_last_planner_response(transcript_path: str, conversation_id: str = "") 
                 lines = lines[1:]
 
             for line in reversed(lines):
-                if '"PLANNER_RESPONSE"' not in line:
+                if '"PLANNER_RESPONSE"' not in line and '"CHECKPOINT"' not in line:
                     continue
                 try:
                     rec = json.loads(line)
                 except Exception:
                     continue
-                if rec.get("type") == "PLANNER_RESPONSE":
+                rec_type = rec.get("type")
+                if rec_type in ("PLANNER_RESPONSE", "CHECKPOINT"):
                     return rec
 
             if read_len >= size:
@@ -218,6 +220,15 @@ def compute_context_metrics(
     raw_pct = cw.get("used_percentage")
     cur = cw.get("current_usage") if isinstance(cw.get("current_usage"), dict) else None
 
+    # Handle post-compaction state where latest turn event is CHECKPOINT
+    if last_rec and last_rec.get("type") == "CHECKPOINT":
+        summary_tokens = int(last_rec.get("output_tokens") or 0)
+        base_overhead = 18_700  # System instructions, skills, tools baseline overhead
+        used_tokens = base_overhead + summary_tokens
+        used_pct = (used_tokens / window_size * 100.0) if window_size > 0 else 0.0
+        used_pct = max(0.0, min(100.0, used_pct))
+        return used_pct, used_tokens, window_size
+
     cur_tokens = 0
     if cur:
         cur_tokens = (
@@ -257,6 +268,10 @@ def compute_cache_metrics(
     last_rec: dict[str, Any] | None,
 ) -> tuple[bool, float, int]:
     """Return (has_data, hit_pct, cache_read_tokens)."""
+    # In post-compaction state (CHECKPOINT), previous prompt cache prefix is invalidated
+    if last_rec and last_rec.get("type") == "CHECKPOINT":
+        return True, 0.0, 0
+
     cur = cw.get("current_usage") if isinstance(cw.get("current_usage"), dict) else None
 
     inp = cr = cc = 0
@@ -316,17 +331,26 @@ def select_quota_buckets(
 
 
 def format_reset_time(reset_dt: datetime | None, now_local: datetime, is_weekly: bool, short: bool) -> str:
-    """Format reset timestamp cleanly without stale countdown drift."""
+    """Format remaining time until quota reset as an intuitive countdown (e.g. 5天16时后重置 / 1时44分后重置)."""
+    del is_weekly  # Duration-based formatting naturally handles both 5h and weekly (including <24h) windows.
     if not reset_dt or reset_dt <= now_local:
         return ""
-    delta_hours = (reset_dt - now_local).total_seconds() / 3600.0
-    if not is_weekly or delta_hours < 24.0:
-        t = reset_dt.strftime("%H:%M")
-    elif short:
-        t = reset_dt.strftime("%m-%d")
+    delta_sec = (reset_dt - now_local).total_seconds()
+    total_mins = max(1, int(math.ceil(delta_sec / 60.0)))
+
+    days = total_mins // (24 * 60)
+    rem_mins = total_mins % (24 * 60)
+    hours = rem_mins // 60
+    mins = rem_mins % 60
+
+    if days > 0:
+        dur = f"{days}天{hours}时" if hours > 0 else f"{days}天"
+    elif hours > 0:
+        dur = f"{hours}时{mins:02d}分" if mins > 0 else f"{hours}时"
     else:
-        t = reset_dt.strftime("%m-%d %H:%M")
-    return t if short else f"{t}重置"
+        dur = f"{mins}分"
+
+    return dur if short else f"{dur}后重置"
 
 
 def render_session_line(
@@ -340,6 +364,7 @@ def render_session_line(
     model_name: str,
     now_local: datetime,
     max_width: int,
+    is_compacted: bool = False,
 ) -> str:
     """Line 1: Context window progress bar + Prompt cache hit & expiry."""
     tiers = [
@@ -375,9 +400,12 @@ def render_session_line(
             cache_seg = f"{FG_GRAY}缓存 待首轮{RESET}"
         elif cache_read <= 0:
             k_col = cache_color(0.0, is_miss=True)
-            miss_tag = "(冷)" if opt["tight"] else "(未命中)"
+            if is_compacted:
+                miss_tag = "(冷)" if opt["tight"] else "(已重置)"
+            else:
+                miss_tag = "(冷)" if opt["tight"] else "(未命中)"
             cache_seg = f"{FG_GRAY}缓存{RESET} {k_col}{BOLD}0%{RESET}{sp}{FG_GRAY}{miss_tag}{RESET}"
-            if exp_text:
+            if exp_text and not is_compacted:
                 cache_seg += f" {exp_col}{exp_text}{RESET}"
         else:
             k_col = cache_color(hit_pct, is_miss=False)
@@ -401,7 +429,7 @@ def render_quota_line(
     now_local: datetime,
     max_width: int,
 ) -> str:
-    """Line 2: 5h & Weekly remaining quota with reset timestamps."""
+    """Line 2: 5h & Weekly remaining quota with reset countdown."""
     pool_label, five_h, weekly = select_quota_buckets(quota, model_name)
     if five_h is None and weekly is None:
         return ""
@@ -483,6 +511,7 @@ def render(payload: dict[str, Any], now_local: datetime | None = None) -> str:
     )
     last_ts_iso = (last_rec or {}).get("created_at")
 
+    is_compacted = bool(last_rec and last_rec.get("type") == "CHECKPOINT")
     used_pct, used_tokens, window_size = compute_context_metrics(cw, last_rec)
     has_cache, hit_pct, cache_read = compute_cache_metrics(cw, last_rec)
 
@@ -497,6 +526,7 @@ def render(payload: dict[str, Any], now_local: datetime | None = None) -> str:
         model_name,
         now,
         max_width,
+        is_compacted=is_compacted,
     )
     line2 = render_quota_line(quota, model_name, now, max_width)
     return f"{line1}\n{line2}" if line2 else line1
