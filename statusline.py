@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Antigravity CLI (agy) custom status line (2-line layout):
   Line 1: Context progress bar + Prompt cache hit rate & estimated expiry
-  Line 2: 5h & Weekly remaining quota + reset timestamps (auto-matches Gemini vs 3P pool)
+  Line 2: 5h & Weekly remaining quota + reset countdown (auto-matches Gemini vs 3P pool)
 
 Designed for stack_with_default: true in ~/.gemini/antigravity-cli/settings.json.
 Pure Python standard library, zero external dependencies, CJK-aware width adaptation.
@@ -10,6 +10,7 @@ Pure Python standard library, zero external dependencies, CJK-aware width adapta
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -330,17 +331,26 @@ def select_quota_buckets(
 
 
 def format_reset_time(reset_dt: datetime | None, now_local: datetime, is_weekly: bool, short: bool) -> str:
-    """Format reset timestamp cleanly without stale countdown drift."""
+    """Format remaining time until quota reset as an intuitive countdown (e.g. 5天16时后重置 / 1时44分后重置)."""
+    del is_weekly  # Duration-based formatting naturally handles both 5h and weekly (including <24h) windows.
     if not reset_dt or reset_dt <= now_local:
         return ""
-    delta_hours = (reset_dt - now_local).total_seconds() / 3600.0
-    if not is_weekly or delta_hours < 24.0:
-        t = reset_dt.strftime("%H:%M")
-    elif short:
-        t = reset_dt.strftime("%m-%d")
+    delta_sec = (reset_dt - now_local).total_seconds()
+    total_mins = max(1, int(math.ceil(delta_sec / 60.0)))
+
+    days = total_mins // (24 * 60)
+    rem_mins = total_mins % (24 * 60)
+    hours = rem_mins // 60
+    mins = rem_mins % 60
+
+    if days > 0:
+        dur = f"{days}天{hours}时" if hours > 0 else f"{days}天"
+    elif hours > 0:
+        dur = f"{hours}时{mins:02d}分" if mins > 0 else f"{hours}时"
     else:
-        t = reset_dt.strftime("%m-%d %H:%M")
-    return t if short else f"{t}重置"
+        dur = f"{mins}分"
+
+    return dur if short else f"{dur}后重置"
 
 
 def render_session_line(
@@ -419,7 +429,7 @@ def render_quota_line(
     now_local: datetime,
     max_width: int,
 ) -> str:
-    """Line 2: 5h & Weekly remaining quota with reset timestamps."""
+    """Line 2: 5h & Weekly remaining quota with reset countdown."""
     pool_label, five_h, weekly = select_quota_buckets(quota, model_name)
     if five_h is None and weekly is None:
         return ""

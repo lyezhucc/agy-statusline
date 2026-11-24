@@ -123,7 +123,7 @@ class TestStatusline(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertIn("17.6% (185k/1M)", lines[0])
         self.assertIn("缓存 95% (168k) 约23:39过期", lines[0])
-        self.assertEqual(lines[1], "限额(Gemini) 5h剩88% (00:24重置) │ 周剩85% (11-29 15:36重置)")
+        self.assertEqual(lines[1], "限额(Gemini) 5h剩88% (1时44分后重置) │ 周剩85% (5天16时后重置)")
 
     def test_claude_exact_ttl_and_3p_pool(self) -> None:
         lines = self._plain_lines(
@@ -148,7 +148,7 @@ class TestStatusline(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertIn("22:44过期", lines[0])
         self.assertNotIn("约22:44", lines[0])
-        self.assertEqual(lines[1], "限额(3P) 5h剩40% (02:10重置) │ 周剩12% (11-30 22:00重置)")
+        self.assertEqual(lines[1], "限额(3P) 5h剩40% (3时29分后重置) │ 周剩12% (6天23时后重置)")
 
     def test_hydrogen_and_expired_labels(self) -> None:
         lines_h = self._plain_lines(
@@ -263,6 +263,29 @@ class TestStatusline(unittest.TestCase):
         finally:
             if os.path.exists(t_next):
                 os.remove(t_next)
+
+    def test_reset_countdown_boundaries(self) -> None:
+        # Past or missing -> empty
+        self.assertEqual(sl.format_reset_time(None, NOW, False, False), "")
+        self.assertEqual(sl.format_reset_time(NOW, NOW, False, False), "")
+        self.assertEqual(sl.format_reset_time(NOW - timedelta(seconds=1), NOW, False, False), "")
+        # Sub-minute rounds up to 1分
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(seconds=10), NOW, False, False), "1分后重置")
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(seconds=10), NOW, False, True), "1分")
+        # Minutes only
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(minutes=42), NOW, False, False), "42分后重置")
+        # Exact hours & hours+minutes with zero-padded minutes
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(hours=2), NOW, False, False), "2时后重置")
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(hours=1, minutes=5), NOW, False, False), "1时05分后重置")
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(hours=1, minutes=5), NOW, False, True), "1时05分")
+        # 23h59m30s rounds up cleanly to 1天 instead of 24时
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(hours=23, minutes=59, seconds=30), NOW, True, False), "1天后重置")
+        # Multi-day + hours & exact days
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(days=4, hours=16, minutes=14), NOW, True, False), "4天16时后重置")
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(days=4, hours=16, minutes=14), NOW, True, True), "4天16时")
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(days=6), NOW, True, False), "6天后重置")
+        # Weekly window < 24h falls back to hours/minutes countdown
+        self.assertEqual(sl.format_reset_time(NOW + timedelta(hours=18, minutes=7), NOW, True, False), "18时07分后重置")
 
 if __name__ == "__main__":
     unittest.main()
