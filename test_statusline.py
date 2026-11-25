@@ -287,5 +287,131 @@ class TestStatusline(unittest.TestCase):
         # Weekly window < 24h falls back to hours/minutes countdown
         self.assertEqual(sl.format_reset_time(NOW + timedelta(hours=18, minutes=7), NOW, True, False), "18时07分后重置")
 
+    def test_claude_missing_3p_pool_never_falls_back_to_gemini_wide_and_narrow(self) -> None:
+        gemini_only_quota = {
+            "gemini-5h": {"remaining_fraction": 0.88, "reset_time": "2026-11-23T16:24:30Z"},
+            "gemini-weekly": {"remaining_fraction": 0.85, "reset_time": "2026-11-29T07:36:48Z"},
+        }
+        for model_id in ("Claude Opus 4.7", "claude-sonnet-4-5", "gpt-4.1", "o3-mini"):
+            self.assertEqual(sl.select_quota_buckets(gemini_only_quota, model_id), ("", None, None))
+            for cols in (110, 80, 76, 65, 52, 46):
+                lines = self._plain_lines(
+                    {
+                        "model": {"id": model_id},
+                        "transcript_path": self.t_recent,
+                        "terminal_width": cols,
+                        "quota": gemini_only_quota,
+                        "context_window": {
+                            "context_window_size": 200000,
+                            "total_input_tokens": 150000,
+                            "used_percentage": 75.0,
+                            "current_usage": {"input_tokens": 10000, "cache_read_input_tokens": 140000},
+                        },
+                    }
+                )
+                self.assertEqual(len(lines), 1, f"Expected single line for {model_id} at {cols} cols, got: {lines}")
+                self.assertNotIn("限额", lines[0])
+                self.assertNotIn("88%", lines[0])
+                self.assertNotIn("85%", lines[0])
+
+    def test_gemini_missing_gemini_pool_never_falls_back_to_3p_wide_and_narrow(self) -> None:
+        three_p_only_quota = {
+            "3p-5h": {"remaining_fraction": 0.40, "reset_time": "2026-11-23T18:10:00Z"},
+            "3p-weekly": {"remaining_fraction": 0.12, "reset_time": "2026-11-30T14:00:00Z"},
+        }
+        for model_id in ("Gemini 4 Neon (XHigh)", "gemini-4-carbon-high", "Gemini 4 Hydrogen (High)"):
+            self.assertEqual(sl.select_quota_buckets(three_p_only_quota, model_id), ("", None, None))
+            for cols in (110, 80, 76, 65, 52, 46):
+                lines = self._plain_lines(
+                    {
+                        "model": {"id": model_id},
+                        "transcript_path": self.t_recent,
+                        "terminal_width": cols,
+                        "quota": three_p_only_quota,
+                        "context_window": {
+                            "context_window_size": 1048576,
+                            "total_input_tokens": 185000,
+                            "used_percentage": 17.64,
+                            "current_usage": {"input_tokens": 8000, "cache_read_input_tokens": 168000},
+                        },
+                    }
+                )
+                self.assertEqual(len(lines), 1, f"Expected single line for {model_id} at {cols} cols, got: {lines}")
+                self.assertNotIn("限额", lines[0])
+                self.assertNotIn("40%", lines[0])
+                self.assertNotIn("12%", lines[0])
+
+    def test_pool_classification_boundaries_and_partial_buckets(self) -> None:
+        # Substring lookalikes like nano1 / pro3 / pro4 must NOT trigger OpenAI o1/o3/o4 3P classification
+        for gm in ("gemini-nano1", "gemini-pro3", "gemini-pro4", "neon-xhigh"):
+            self.assertEqual(sl.classify_model_pool(gm), "Gemini")
+        for tp in ("Claude Haiku 4.5", "gpt-5", "o1", "o3-mini", "o4-mini", "openai/o3"):
+            self.assertEqual(sl.classify_model_pool(tp), "3P")
+        for unk in ("", "   ", "unknown-model", "mystery-model", "proto3", "claude-vs-gemini"):
+            self.assertIsNone(sl.classify_model_pool(unk))
+            self.assertEqual(sl.select_quota_buckets(self.quota, unk), ("", None, None))
+
+        # Explicit unknown model in payload must NOT leak stale Gemini model from transcript_path
+        lines_unk = self._plain_lines(
+            {
+                "model": {"id": "unknown-model"},
+                "transcript_path": self.t_recent,
+                "terminal_width": 60,
+                "quota": self.quota,
+                "context_window": {"context_window_size": 200000, "total_input_tokens": 50000, "used_percentage": 25.0},
+            }
+        )
+        self.assertEqual(len(lines_unk), 1)
+
+        # Opaque model.id with recognizable model.display_name resolves active pool properly
+        lines_disp = self._plain_lines(
+            {
+                "model": {"id": "custom-endpoint-1", "display_name": "Claude Opus 4.7"},
+                "transcript_path": self.t_recent,
+                "terminal_width": 58,
+                "quota": self.quota,
+                "context_window": {"context_window_size": 200000, "total_input_tokens": 50000, "used_percentage": 25.0},
+            }
+        )
+        self.assertEqual(len(lines_disp), 2)
+        self.assertIn("限额(3P) 5h剩40%", lines_disp[1])
+
+        # Partial 3P bucket (only 3p-5h, no 3p-weekly) never borrows gemini-weekly
+        partial_quota = {
+            "3p-5h": {"remaining_fraction": 0.40, "reset_time": "2026-11-23T18:10:00Z"},
+            "gemini-weekly": {"remaining_fraction": 0.85, "reset_time": "2026-11-29T07:36:48Z"},
+        }
+        lbl, b5, bw = sl.select_quota_buckets(partial_quota, "Claude Opus 4.7")
+        self.assertEqual(lbl, "3P")
+        self.assertIsNotNone(b5)
+        self.assertIsNone(bw)
+
+        # Unscoped generic keys work when no pool prefixes exist, while foreign scoped keys are rejected
+        unscoped = {"5h": {"remaining_fraction": 0.66, "reset_time": "2026-11-23T16:24:30Z"}}
+        self.assertEqual(sl.select_quota_buckets(unscoped, "Claude Opus 4.7"), ("", unscoped["5h"], None))
+        foreign = {"other-vendor-5h": {"remaining_fraction": 0.66}}
+        self.assertEqual(sl.select_quota_buckets(foreign, "Claude Opus 4.7"), ("", None, None))
+
+    def test_malformed_fields_graceful_degradation(self) -> None:
+        lines = self._plain_lines(
+            {
+                "model": {"id": "Claude Opus 4.7"},
+                "transcript_path": self.t_recent,
+                "terminal_width": "auto",
+                "quota": {
+                    "3p-5h": {"remaining_fraction": True},
+                    "3p-weekly": {"remaining_fraction": 0.25, "reset_time": "2026-11-30T14:00:00Z"},
+                },
+                "context_window": {
+                    "context_window_size": "200000",
+                    "total_input_tokens": 50000,
+                    "used_percentage": float("nan"),
+                },
+            }
+        )
+        self.assertEqual(len(lines), 2)
+        self.assertIn("25.0% (50k/200k)", lines[0])
+        self.assertEqual(lines[1], "限额(3P) 周剩25% (6天23时后重置)")
+
 if __name__ == "__main__":
     unittest.main()

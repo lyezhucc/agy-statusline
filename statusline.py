@@ -28,6 +28,46 @@ FG_CYAN = "\033[36m"
 FG_GRAY = "\033[90m"
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_GEMINI_SUBSTR_RE = re.compile(r"gemini")
+_GEMINI_CODENAME_RE = re.compile(r"(?<![a-z0-9])(?:neon|hydrogen|carbon)(?![a-z0-9])")
+_3P_SUBSTR_RE = re.compile(r"(?:claude|anthropic|opus|sonnet|haiku|gpt|openai)")
+_3P_O_SERIES_RE = re.compile(r"(?<![a-z0-9])o[134](?:$|[^a-z0-9]|mini|pro|preview)")
+_UNSCOPED_5H_KEYS = frozenset({"5h", "five_hour", "five-hour", "session"})
+_UNSCOPED_WEEKLY_KEYS = frozenset({"weekly", "week", "7d", "seven_day", "seven-day"})
+
+
+def _safe_int(val: Any, default: int = 0) -> int:
+    if isinstance(val, bool) or val is None:
+        return default
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val) if math.isfinite(val) else default
+    if isinstance(val, str):
+        s = val.strip()
+        if s:
+            try:
+                f = float(s)
+                return int(f) if math.isfinite(f) else default
+            except ValueError:
+                return default
+    return default
+
+
+def classify_model_pool(model_name: str | None) -> str | None:
+    """Identify the quota pool ('Gemini' or '3P') for model_name, or None if unrecognized."""
+    ml = (model_name or "").strip().lower()
+    if not ml:
+        return None
+    is_3p = bool(_3P_SUBSTR_RE.search(ml) or _3P_O_SERIES_RE.search(ml))
+    is_gemini = bool(_GEMINI_SUBSTR_RE.search(ml) or (not is_3p and _GEMINI_CODENAME_RE.search(ml)))
+    if is_gemini and is_3p:
+        return None
+    if is_gemini:
+        return "Gemini"
+    if is_3p:
+        return "3P"
+    return None
 
 
 def visible_width(text: str) -> int:
@@ -43,9 +83,15 @@ def visible_width(text: str) -> int:
 
 def format_tokens(n: int | float | None) -> str:
     """Format token counts compactly (e.g. 850, 7.4k, 135k, 1M)."""
-    if n is None:
+    if n is None or isinstance(n, bool):
         return "0"
-    val = max(0.0, float(n))
+    try:
+        f = float(n)
+    except (TypeError, ValueError):
+        return "0"
+    if not math.isfinite(f):
+        return "0"
+    val = max(0.0, f)
     if val >= 1_000_000:
         m = val / 1_000_000.0
         if abs(val - 1_048_576) <= 1024 or abs(m - round(m)) < 0.05:
@@ -90,14 +136,15 @@ def quota_color(rem_pct: float, disabled: bool = False) -> str:
     return FG_GREEN
 
 
-def parse_iso_local(iso_ts: str | None) -> datetime | None:
+def parse_iso_local(iso_ts: str | None, tz: Any = None) -> datetime | None:
     if not iso_ts or not isinstance(iso_ts, str):
         return None
     try:
         ts = iso_ts.strip()
         if ts.endswith("Z"):
             ts = ts[:-1] + "+00:00"
-        return datetime.fromisoformat(ts).astimezone()
+        dt = datetime.fromisoformat(ts)
+        return dt.astimezone(tz) if tz is not None else dt.astimezone()
     except Exception:
         return None
 
@@ -192,7 +239,7 @@ def format_cache_expiry(
     compact_label: bool = False,
 ) -> tuple[str, str]:
     """Return (display_text, ansi_color) for cache expiry indicator."""
-    last_dt = parse_iso_local(last_ts_iso)
+    last_dt = parse_iso_local(last_ts_iso, now_local.tzinfo)
     if not last_dt:
         return "", FG_GRAY
 
@@ -216,13 +263,13 @@ def compute_context_metrics(
     last_rec: dict[str, Any] | None,
 ) -> tuple[float, int, int]:
     """Return (used_pct, used_tokens, window_size)."""
-    window_size = int(cw.get("context_window_size") or 0)
+    window_size = max(0, _safe_int(cw.get("context_window_size")))
     raw_pct = cw.get("used_percentage")
     cur = cw.get("current_usage") if isinstance(cw.get("current_usage"), dict) else None
 
     # Handle post-compaction state where latest turn event is CHECKPOINT
     if last_rec and last_rec.get("type") == "CHECKPOINT":
-        summary_tokens = int(last_rec.get("output_tokens") or 0)
+        summary_tokens = max(0, _safe_int(last_rec.get("output_tokens")))
         base_overhead = 18_700  # System instructions, skills, tools baseline overhead
         used_tokens = base_overhead + summary_tokens
         used_pct = (used_tokens / window_size * 100.0) if window_size > 0 else 0.0
@@ -232,20 +279,20 @@ def compute_context_metrics(
     cur_tokens = 0
     if cur:
         cur_tokens = (
-            int(cur.get("input_tokens") or 0)
-            + int(cur.get("cache_read_input_tokens") or 0)
-            + int(cur.get("cache_creation_input_tokens") or 0)
-            + int(cur.get("output_tokens") or 0)
+            max(0, _safe_int(cur.get("input_tokens")))
+            + max(0, _safe_int(cur.get("cache_read_input_tokens")))
+            + max(0, _safe_int(cur.get("cache_creation_input_tokens")))
+            + max(0, _safe_int(cur.get("output_tokens")))
         )
     elif last_rec:
         cur_tokens = (
-            int(last_rec.get("input_tokens") or 0)
-            + int(last_rec.get("cache_read_tokens") or 0)
-            + int(last_rec.get("output_tokens") or 0)
+            max(0, _safe_int(last_rec.get("input_tokens")))
+            + max(0, _safe_int(last_rec.get("cache_read_tokens")))
+            + max(0, _safe_int(last_rec.get("output_tokens")))
         )
 
-    total_in_reported = int(cw.get("total_input_tokens") or 0)
-    if isinstance(raw_pct, (int, float)):
+    total_in_reported = max(0, _safe_int(cw.get("total_input_tokens")))
+    if isinstance(raw_pct, (int, float)) and not isinstance(raw_pct, bool) and math.isfinite(raw_pct):
         used_pct = max(0.0, min(100.0, float(raw_pct)))
         if window_size > 0:
             pct_tokens = int(round(used_pct / 100.0 * window_size))
@@ -278,17 +325,17 @@ def compute_cache_metrics(
     has_usage = False
 
     if cur is not None:
-        inp = int(cur.get("input_tokens") or 0)
-        cr = int(cur.get("cache_read_input_tokens") or 0)
-        cc = int(cur.get("cache_creation_input_tokens") or 0)
-        if inp > 0 or cr > 0 or cc > 0 or int(cur.get("output_tokens") or 0) > 0:
+        inp = max(0, _safe_int(cur.get("input_tokens")))
+        cr = max(0, _safe_int(cur.get("cache_read_input_tokens")))
+        cc = max(0, _safe_int(cur.get("cache_creation_input_tokens")))
+        if inp > 0 or cr > 0 or cc > 0 or _safe_int(cur.get("output_tokens")) > 0:
             has_usage = True
 
     if not has_usage and last_rec is not None:
-        inp = int(last_rec.get("input_tokens") or 0)
-        cr = int(last_rec.get("cache_read_tokens") or 0)
+        inp = max(0, _safe_int(last_rec.get("input_tokens")))
+        cr = max(0, _safe_int(last_rec.get("cache_read_tokens")))
         cc = 0
-        if inp > 0 or cr > 0 or int(last_rec.get("output_tokens") or 0) > 0:
+        if inp > 0 or cr > 0 or _safe_int(last_rec.get("output_tokens")) > 0:
             has_usage = True
 
     total_in = inp + cr + cc
@@ -302,31 +349,38 @@ def select_quota_buckets(
     quota: dict[str, Any],
     model_name: str,
 ) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None]:
-    """Pick (pool_label, five_hour_bucket, weekly_bucket) matching the active model pool."""
-    if not quota:
+    """Pick (pool_label, five_hour_bucket, weekly_bucket) strictly matching the active model pool.
+
+    Never falls back across model pools (e.g. never returns Gemini quota for Claude/GPT or vice versa),
+    preventing silent cross-pool misattribution especially on narrow (<78 col) terminals where pool tags hide.
+    """
+    if not isinstance(quota, dict) or not quota:
         return "", None, None
 
-    ml = (model_name or "").lower()
-    prefer_3p = any(k in ml for k in ("claude", "gpt", "opus", "sonnet", "haiku", "o1", "o3", "o4"))
-    order = (("3p-", "3P"), ("gemini-", "Gemini")) if prefer_3p else (("gemini-", "Gemini"), ("3p-", "3P"))
+    norm: dict[str, Any] = {str(k).strip().lower(): v for k, v in quota.items()}
+    has_named_pools = any(
+        k.startswith(("gemini-", "gemini_", "1p-", "1p_", "3p-", "3p_"))
+        for k in norm
+    )
 
-    for pref, label in order:
-        five_h = quota.get(f"{pref}5h") if isinstance(quota.get(f"{pref}5h"), dict) else None
-        weekly = quota.get(f"{pref}weekly") if isinstance(quota.get(f"{pref}weekly"), dict) else None
+    pool = classify_model_pool(model_name)
+    if has_named_pools:
+        if pool == "Gemini":
+            prefixes, label = ("gemini-", "gemini_", "1p-", "1p_"), "Gemini"
+        elif pool == "3P":
+            prefixes, label = ("3p-", "3p_"), "3P"
+        else:
+            return "", None, None
+
+        five_h = next((norm[f"{p}5h"] for p in prefixes if isinstance(norm.get(f"{p}5h"), dict)), None)
+        weekly = next((norm[f"{p}weekly"] for p in prefixes if isinstance(norm.get(f"{p}weekly"), dict)), None)
         if five_h is not None or weekly is not None:
             return label, five_h, weekly
+        return "", None, None
 
-    # Generic fallback for any future bucket naming
-    five_h = weekly = None
-    for key, val in quota.items():
-        if not isinstance(val, dict):
-            continue
-        kl = key.lower()
-        if five_h is None and ("5h" in kl or "five" in kl or "session" in kl):
-            five_h = val
-        elif weekly is None and ("week" in kl or "7d" in kl):
-            weekly = val
-
+    # Unscoped generic fallback only when quota uses pool-agnostic keys (never foreign model-scoped keys)
+    five_h = next((val for k, val in norm.items() if k in _UNSCOPED_5H_KEYS and isinstance(val, dict)), None)
+    weekly = next((val for k, val in norm.items() if k in _UNSCOPED_WEEKLY_KEYS and isinstance(val, dict)), None)
     return "", five_h, weekly
 
 
@@ -438,10 +492,10 @@ def render_quota_line(
         if not isinstance(bucket, dict):
             return None, None, False
         frac = bucket.get("remaining_fraction")
-        if not isinstance(frac, (int, float)):
+        if not isinstance(frac, (int, float)) or isinstance(frac, bool) or not math.isfinite(frac):
             return None, None, bool(bucket.get("disabled"))
         rem = max(0.0, min(100.0, float(frac) * 100.0))
-        return rem, parse_iso_local(bucket.get("reset_time")), bool(bucket.get("disabled"))
+        return rem, parse_iso_local(bucket.get("reset_time"), now_local.tzinfo), bool(bucket.get("disabled"))
 
     rem5, reset5_dt, dis5 = parse_bucket(five_h)
     remw, resetw_dt, disw = parse_bucket(weekly)
@@ -450,6 +504,7 @@ def render_quota_line(
 
     tiers = [
         dict(show_prefix=True, show_pool=True, show_5h_reset=True, show_w_reset=True, short_time=False, compact=False),
+        dict(show_prefix=True, show_pool=True, show_5h_reset=True, show_w_reset=True, short_time=True, compact=False),
         dict(show_prefix=True, show_pool=False, show_5h_reset=True, show_w_reset=True, short_time=False, compact=False),
         dict(show_prefix=True, show_pool=False, show_5h_reset=True, show_w_reset=True, short_time=True, compact=False),
         dict(show_prefix=False, show_pool=False, show_5h_reset=True, show_w_reset=False, short_time=True, compact=False),
@@ -495,20 +550,34 @@ def render_quota_line(
 
 
 def render(payload: dict[str, Any], now_local: datetime | None = None) -> str:
-    now = now_local.astimezone() if now_local else datetime.now().astimezone()
+    if now_local is None:
+        now = datetime.now().astimezone()
+    elif now_local.tzinfo is None:
+        now = now_local.astimezone()
+    else:
+        now = now_local
     cw = payload.get("context_window") if isinstance(payload.get("context_window"), dict) else {}
     quota = payload.get("quota") if isinstance(payload.get("quota"), dict) else {}
     model_obj = payload.get("model") if isinstance(payload.get("model"), dict) else {}
-    transcript_path = payload.get("transcript_path") or ""
-    conversation_id = payload.get("conversation_id") or payload.get("session_id") or ""
-    cols = int(payload.get("terminal_width") or 100)
+    transcript_path = payload.get("transcript_path") if isinstance(payload.get("transcript_path"), str) else ""
+    raw_cid = payload.get("conversation_id") or payload.get("session_id") or ""
+    conversation_id = raw_cid if isinstance(raw_cid, str) else ""
+    cols = _safe_int(payload.get("terminal_width"), default=100)
+    if cols <= 0:
+        cols = 100
     max_width = max(24, cols - 2)
 
     last_rec = read_last_planner_response(transcript_path, conversation_id)
-    model_name = (
-        str(model_obj.get("id") or model_obj.get("display_name") or "")
-        or str((last_rec or {}).get("model") or "")
-    )
+    model_id = str(model_obj.get("id") or "").strip()
+    model_disp = str(model_obj.get("display_name") or "").strip()
+    rec_model = str((last_rec or {}).get("model") or "").strip()
+    if model_id or model_disp:
+        if classify_model_pool(model_id) is None and classify_model_pool(model_disp) is not None:
+            model_name = model_disp
+        else:
+            model_name = model_id or model_disp
+    else:
+        model_name = rec_model
     last_ts_iso = (last_rec or {}).get("created_at")
 
     is_compacted = bool(last_rec and last_rec.get("type") == "CHECKPOINT")
